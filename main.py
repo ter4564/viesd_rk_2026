@@ -1,6 +1,7 @@
 import asyncio
 import csv
 import html
+import json
 import os
 import re
 from datetime import datetime, date
@@ -22,6 +23,7 @@ from aiogram.types import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "9142696714:AAFMi5254_4ROAGumEPC7mI1ArrqdECbxzU")
 ADMIN_ID = 1682544256
 CSV_FILE = "участники_выезд.csv"  # новый файл: структура отличается от старой версии бота
+PENDING_FILE = "незавершенные.json"  # те, кто начал регистрацию, но не закончил
 # =============================================
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -164,6 +166,60 @@ def get_all_user_ids() -> list[int]:
     return list(load_all().keys())
 
 
+# ================= Незавершённые регистрации =================
+def _load_pending_raw() -> dict:
+    if not os.path.isfile(PENDING_FILE):
+        return {}
+    try:
+        with open(PENDING_FILE, mode="r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_pending_raw(data: dict) -> None:
+    with open(PENDING_FILE, mode="w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def mark_pending(user: types.User, step: str) -> None:
+    """Запоминает, что человек начал регистрацию и остановился на шаге step."""
+    data = _load_pending_raw()
+    key = str(user.id)
+    now = datetime.now().isoformat(timespec="seconds")
+    entry = data.get(key, {})
+    entry.update({
+        "username": user.username or "",
+        "name": user.full_name or "",
+        "step": step,
+        "started": entry.get("started", now),
+        "updated": now,
+    })
+    data[key] = entry
+    _save_pending_raw(data)
+
+
+def clear_pending(user_id: int) -> None:
+    data = _load_pending_raw()
+    if str(user_id) in data:
+        del data[str(user_id)]
+        _save_pending_raw(data)
+
+
+def get_pending() -> dict[int, dict]:
+    """Незавершившие регистрацию (те, кто уже есть в таблице, не учитываются)."""
+    registered = set(load_all().keys())
+    result = {}
+    for key, info in _load_pending_raw().items():
+        try:
+            uid = int(key)
+        except ValueError:
+            continue
+        if uid not in registered:
+            result[uid] = info
+    return result
+
+
 # ================= Клавиатуры =================
 def main_menu(registered: bool) -> ReplyKeyboardMarkup:
     if registered:
@@ -213,7 +269,8 @@ def edit_fields_kb() -> InlineKeyboardMarkup:
 PROMPTS = {
     "full_name": (
         "📝 <b>Шаг 1 из 7. ФИО</b>\n\n"
-        "Введи свои <b>фамилию, имя и отчество</b> полностью, через пробел.\n"
+        "Введи свои <b>фамилию, имя и отчество</b> полностью, через пробел. "
+        "В каждом слове должно быть минимум 2 буквы.\n"
         "Пример: <i>Иванов Иван Иванович</i>"
     ),
     "birth_date": (
@@ -223,8 +280,8 @@ PROMPTS = {
     ),
     "group": (
         "🎓 <b>Шаг 3 из 7. Учебная группа</b>\n\n"
-        "Введи название своей группы так, как оно написано в расписании.\n"
-        "Пример: <i>РК6-31Б</i>"
+        "Введи название своей группы русскими буквами, как в расписании.\n"
+        "Примеры: <i>РК6-13Б</i> или <i>РК6-13/6</i>"
     ),
     "tg_nick": (
         "💬 <b>Шаг 4 из 7. Ник в Telegram</b>\n\n"
@@ -233,8 +290,9 @@ PROMPTS = {
     ),
     "phone": (
         "📞 <b>Шаг 5 из 7. Номер телефона</b>\n\n"
-        "Введи номер в формате <b>8XXXXXXXXXX</b> (11 цифр, без пробелов, скобок и тире).\n"
-        "Пример: <i>89001234567</i>\n\n"
+        "Введи номер в формате <b>8XXXXXXXXXX</b> или <b>+7XXXXXXXXXX</b> "
+        "(после 8 или +7 — ровно 10 цифр).\n"
+        "Примеры: <i>89001234567</i> или <i>+79001234567</i>\n\n"
         "Или просто нажми кнопку ниже, чтобы отправить номер автоматически 👇"
     ),
     "meat": (
@@ -258,11 +316,21 @@ PROMPTS = {
 }
 
 ERRORS = {
-    "full_name": "❌ Нужно ввести <b>три слова</b> — фамилию, имя и отчество, только буквами.\nПример: <i>Иванов Иван Иванович</i>",
+    "full_name": (
+        "❌ Нужно ввести <b>три слова</b> — фамилию, имя и отчество, только буквами, "
+        "<b>минимум по 2 буквы</b> в каждом слове.\nПример: <i>Иванов Иван Иванович</i>"
+    ),
     "birth_date": "❌ Не получилось распознать дату. Введи её в формате <b>ДД.ММ.ГГГГ</b>.\nПример: <i>25.03.2005</i>",
-    "group": "❌ Неверный формат группы. Пример: <i>РК6-31Б</i>",
+    "group": (
+        "❌ Неверный формат группы. Используй русские буквы и один из шаблонов:\n"
+        "<i>РК6-13Б</i> или <i>РК6-13/6</i>"
+    ),
     "tg_nick": "❌ Ник должен начинаться с <b>@</b> и содержать от 5 до 32 символов (латинские буквы, цифры, «_»).\nПример: <i>@ivan_ivanov</i>",
-    "phone": "❌ Номер должен быть в формате <b>8XXXXXXXXXX</b> (ровно 11 цифр).\nПример: <i>89001234567</i>",
+    "phone": (
+        "❌ Номер введён неверно. Он должен быть в формате <b>8XXXXXXXXXX</b> или "
+        "<b>+7XXXXXXXXXX</b> — ровно 10 цифр после 8 или +7, и цифры не должны быть "
+        "все одинаковыми.\nПримеры: <i>89001234567</i> или <i>+79001234567</i>"
+    ),
     "meat": "❌ Пожалуйста, выбери ответ кнопкой: <b>Да</b> или <b>Нет</b>.",
     "health": "❌ Пожалуйста, выбери ответ кнопкой: <b>Да</b> или <b>Нет</b>.",
     "health_details": "❌ Опиши, пожалуйста, текстом (хотя бы пару слов).",
@@ -282,6 +350,11 @@ def keyboard_for(step: str):
 async def ask(message: types.Message, state: FSMContext, step: str):
     """Задаёт вопрос и переключает состояние на нужный шаг."""
     await state.set_state(STEP_STATE[step])
+    data = await state.get_data()
+    user = message.from_user
+    # В режиме регистрации (не редактирования) запоминаем, на каком шаге человек остановился
+    if not data.get("edit_field") and user and not user.is_bot:
+        mark_pending(user, step)
     await message.answer(PROMPTS[step], reply_markup=keyboard_for(step))
 
 
@@ -292,8 +365,13 @@ def v_full_name(message: types.Message):
     words = message.text.split()
     if len(words) != 3:
         return None
-    if not all(re.fullmatch(r"[А-Яа-яЁёA-Za-z-]+", w) for w in words):
-        return None
+    for w in words:
+        # только буквы (допустим дефис между частями), без цифр и лишних символов
+        if not re.fullmatch(r"[А-Яа-яЁёA-Za-z]+(?:-[А-Яа-яЁёA-Za-z]+)*", w):
+            return None
+        # минимум 2 буквы (в каждой части двойной фамилии тоже)
+        if any(len(part) < 2 for part in w.split("-")):
+            return None
     return " ".join(w[:1].upper() + w[1:] for w in words)
 
 
@@ -313,7 +391,8 @@ def v_group(message: types.Message):
     if not message.text:
         return None
     value = message.text.strip().upper()
-    if re.fullmatch(r"[А-ЯЁA-Z]{1,5}\d{0,2}-\d{1,3}[А-ЯЁA-Z]{0,2}", value):
+    # Шаблоны: РК6-13Б (буква в конце) или РК6-13/6 (дробь в конце)
+    if re.fullmatch(r"[А-ЯЁ]{2,4}\d{1,2}-\d{1,3}(?:/\d{1,2}|[А-ЯЁ])", value):
         return value
     return None
 
@@ -327,17 +406,34 @@ def v_tg_nick(message: types.Message):
     return None
 
 
+def normalize_phone(raw: str, from_contact: bool = False) -> str | None:
+    """Приводит номер к виду 8XXXXXXXXXX. Возвращает None, если номер не подходит."""
+    value = re.sub(r"[\s\-()]", "", raw)  # пробелы, тире и скобки не мешают
+
+    if from_contact:
+        # Telegram присылает номер контакта как 79001234567 или +79001234567
+        digits = value.lstrip("+")
+        if not re.fullmatch(r"[78]\d{10}", digits):
+            return None
+        rest = digits[1:]
+    else:
+        m = re.fullmatch(r"(?:8|\+7)(\d{10})", value)
+        if not m:
+            return None
+        rest = m.group(1)
+
+    # Все цифры одинаковые (например, 8 0000000000 или 8 1111111111) — не настоящий номер
+    if len(set(rest)) == 1:
+        return None
+    return "8" + rest
+
+
 def v_phone(message: types.Message):
     if message.contact:
-        digits = re.sub(r"\D", "", message.contact.phone_number)
-        # +7XXXXXXXXXX или 7XXXXXXXXXX -> 8XXXXXXXXXX
-        if len(digits) == 11 and digits[0] == "7":
-            digits = "8" + digits[1:]
-        return digits if re.fullmatch(r"8\d{10}", digits) else None
+        return normalize_phone(message.contact.phone_number, from_contact=True)
     if not message.text:
         return None
-    value = message.text.strip()
-    return value if re.fullmatch(r"8\d{10}", value) else None
+    return normalize_phone(message.text)
 
 
 def v_yes_no(message: types.Message):
@@ -417,6 +513,7 @@ async def accept_value(message: types.Message, state: FSMContext, field: str, va
     record = {key: data.get(key, "") for key in ORDER}
     record["username"] = user.username or "нет"
     upsert_participant(user.id, record)
+    clear_pending(user.id)
     await state.clear()
     await message.answer(
         "🎉 <b>Регистрация завершена!</b>\n\n"
@@ -440,6 +537,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def cmd_cancel(message: types.Message, state: FSMContext):
     was_filling = await state.get_state() is not None
     await state.clear()
+    clear_pending(message.from_user.id)  # человек сам отменил — больше не считаем «незавершившим»
     registered = get_participant(message.from_user.id) is not None
     if was_filling:
         text = "❌ Заполнение анкеты отменено. Введённые в этот раз данные не сохранены."
@@ -512,34 +610,6 @@ async def choose_field(callback: CallbackQuery, state: FSMContext):
     await ask(callback.message, state, field)
 
 
-# Один обработчик на все шаги анкеты (регистрация и редактирование)
-@dp.message(StateFilter(*STEP_STATE.values()))
-async def process_step(message: types.Message, state: FSMContext):
-    step = STATE_TO_STEP[await state.get_state()]
-
-    # Кнопка «Назад» на шаге уточнения болезней — возвращаемся к вопросу Да/Нет
-    if step == "health_details" and message.text == BTN_BACK:
-        await ask(message, state, "health")
-        return
-
-    value = VALIDATORS[step](message)
-
-    if value is None:
-        await message.answer(ERRORS[step])
-        return
-
-    # Вопрос про болезни: «Нет» — идём дальше, «Да» — просим описать
-    if step == "health":
-        if value == "Да":
-            await ask(message, state, "health_details")
-        else:
-            await accept_value(message, state, "health", "Нет")
-        return
-
-    field = "health" if step == "health_details" else step
-    await accept_value(message, state, field, value)
-
-
 # Админ-команда для рассылки: /send Текст сообщения
 @dp.message(Command("send"))
 async def cmd_send_all(message: types.Message):
@@ -575,6 +645,115 @@ async def cmd_send_all(message: types.Message):
     await message.answer(f"✅ Рассылка завершена! Сообщение получили: {count} чел.")
 
 
+STEP_TITLES = {**FIELD_TITLES, "health_details": "Здоровье (уточнение)"}
+DEFAULT_REMIND_TEXT = (
+    "⏰ Ты начал(а) регистрацию на выезд, но не завершил(а) её.\n\n"
+    "Места и время ограничены — поторопись! Нажми /registration "
+    "(или кнопку «Регистрация») и заполни анкету до конца. Это займёт пару минут."
+)
+
+
+def _fmt_time(iso: str) -> str:
+    try:
+        return datetime.fromisoformat(iso).strftime("%d.%m %H:%M")
+    except (ValueError, TypeError):
+        return "—"
+
+
+# Админ-команда: список тех, кто не завершил регистрацию
+@dp.message(Command("unfinished"))
+async def cmd_unfinished(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    pending = get_pending()
+    if not pending:
+        await message.answer("🎉 Все, кто начал регистрацию, её завершили.")
+        return
+
+    items = sorted(pending.items(), key=lambda kv: kv[1].get("updated", ""))
+    lines = []
+    for i, (uid, info) in enumerate(items, 1):
+        name = html.escape(info.get("name") or "без имени")
+        username = f"@{html.escape(info['username'])}" if info.get("username") else "без ника"
+        step = STEP_TITLES.get(info.get("step"), "—")
+        lines.append(
+            f"{i}. <a href=\"tg://user?id={uid}\">{name}</a> ({username})\n"
+            f"    остановился на шаге: <b>{html.escape(step)}</b>\n"
+            f"    начал: {_fmt_time(info.get('started'))}, "
+            f"последняя активность: {_fmt_time(info.get('updated'))}"
+        )
+
+    header = f"⏳ <b>Не завершили регистрацию: {len(items)} чел.</b>\n\n"
+    footer = "\n\nНапомнить всем: <code>/remind</code>"
+
+    # Telegram ограничивает длину сообщения, поэтому режем на части
+    chunk = header
+    for line in lines:
+        if len(chunk) + len(line) > 3500:
+            await message.answer(chunk)
+            chunk = ""
+        chunk += line + "\n\n"
+    await message.answer(chunk.rstrip() + footer)
+
+
+# Админ-команда: напомнить незавершившим. /remind  или  /remind Свой текст
+@dp.message(Command("remind"))
+async def cmd_remind(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    pending = get_pending()
+    if not pending:
+        await message.answer("🎉 Некому напоминать — незавершённых регистраций нет.")
+        return
+
+    custom = message.text.partition(" ")[2].strip()
+    text = custom or DEFAULT_REMIND_TEXT
+
+    ok, failed = 0, []
+    for uid, info in pending.items():
+        try:
+            await bot.send_message(chat_id=uid, text=text, parse_mode=None)
+            ok += 1
+        except Exception:
+            failed.append(info.get("name") or str(uid))
+        await asyncio.sleep(0.05)
+
+    report = f"✅ Напоминание отправлено: {ok} из {len(pending)} чел."
+    if failed:
+        report += "\n⚠️ Не доставлено (возможно, заблокировали бота): " + html.escape(", ".join(failed))
+    await message.answer(report)
+
+
+# Один обработчик на все шаги анкеты (регистрация и редактирование)
+@dp.message(StateFilter(*STEP_STATE.values()))
+async def process_step(message: types.Message, state: FSMContext):
+    step = STATE_TO_STEP[await state.get_state()]
+
+    # Кнопка «Назад» на шаге уточнения болезней — возвращаемся к вопросу Да/Нет
+    if step == "health_details" and message.text == BTN_BACK:
+        await ask(message, state, "health")
+        return
+
+    value = VALIDATORS[step](message)
+
+    if value is None:
+        await message.answer(ERRORS[step])
+        return
+
+    # Вопрос про болезни: «Нет» — идём дальше, «Да» — просим описать
+    if step == "health":
+        if value == "Да":
+            await ask(message, state, "health_details")
+        else:
+            await accept_value(message, state, "health", "Нет")
+        return
+
+    field = "health" if step == "health_details" else step
+    await accept_value(message, state, field, value)
+
+
 COMMANDS = [
     BotCommand(command="start", description="перезапуск бота"),
     BotCommand(command="info", description="о выезде"),
@@ -608,10 +787,18 @@ async def setup_commands():
         print(f"Не удалось проверить команды: {e}")
 
 
+ADMIN_COMMANDS = [
+    BotCommand(command="unfinished", description="кто не завершил регистрацию"),
+    BotCommand(command="remind", description="напомнить незавершившим"),
+    BotCommand(command="send", description="рассылка участникам"),
+]
+
+
 async def setup_chat_commands(chat_id: int):
     """Команды именно для этого чата — у них самый высокий приоритет в Telegram."""
+    commands = COMMANDS + ADMIN_COMMANDS if chat_id == ADMIN_ID else COMMANDS
     try:
-        await bot.set_my_commands(COMMANDS, scope=BotCommandScopeChat(chat_id=chat_id))
+        await bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=chat_id))
         await bot.set_chat_menu_button(chat_id=chat_id, menu_button=MenuButtonCommands())
     except Exception as e:
         print(f"Не удалось установить команды для чата {chat_id}: {e}")
